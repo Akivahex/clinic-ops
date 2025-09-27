@@ -1,0 +1,92 @@
+---
+- hosts: webserver
+  become: yes
+  gather_facts: no
+
+  vars:
+    n8n_data_dir: /opt/n8n/.n8n
+    n8n_image: docker.io/n8nio/n8n:latest
+    n8n_container: n8n
+    n8n_unit: "container-{{ n8n_container }}.service"
+    n8n_host_ip: 127.0.0.1
+    n8n_host_port: 5678
+    n8n_container_port: 5678
+
+  tasks:
+    # Asegurar carpeta y propietario (por si faltó en la corrida anterior)
+    - name: Ensure n8n data dir exists
+      file:
+        path: "{{ n8n_data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure n8n data dir owner 1000:1000
+      file:
+        path: "{{ n8n_data_dir }}"
+        owner: "1000"
+        group: "1000"
+        state: directory
+
+    # ¿Existe ya el contenedor n8n?
+    - name: Check if container exists
+      command: podman container exists {{ n8n_container }}
+      register: exists_rc
+      failed_when: false
+      changed_when: false
+
+    # Si NO existe, crearlo
+    - name: Create n8n container if missing
+      command:
+        argv:
+          - podman
+          - create
+          - --replace
+          - --name
+          - "{{ n8n_container }}"
+          - --restart=always
+          - -p
+          - "{{ n8n_host_ip }}:{{ n8n_host_port }}:{{ n8n_container_port }}"
+          - -v
+          - "{{ n8n_data_dir }}:/home/node/.n8n"
+          - -e
+          - "GENERIC_TIMEZONE=Europe/Berlin"
+          - -e
+          - "N8N_PORT={{ n8n_container_port }}"
+          - -e
+          - "N8N_METRICS=false"
+          - -e
+          - "N8N_DIAGNOSTICS_ENABLED=false"
+          - "{{ n8n_image }}"
+      when: exists_rc.rc != 0
+
+    # Generar el unit hacia /tmp
+    - name: Generate systemd unit for n8n
+      command: >
+        podman generate systemd --name {{ n8n_container }} --files --new --restart-policy=always
+      args:
+        chdir: /tmp
+
+    # Instalar unit en /etc/systemd/system
+    - name: Install systemd unit
+      copy:
+        src: "/tmp/container-{{ n8n_container }}.service"
+        dest: "/etc/systemd/system/{{ n8n_unit }}"
+        remote_src: true
+        mode: "0644"
+
+    - name: daemon-reload
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable & start n8n
+      systemd:
+        name: "{{ n8n_unit }}"
+        enabled: yes
+        state: started
+
+    - name: Wait for n8n to listen on localhost
+      wait_for:
+        host: "127.0.0.1"
+        port: "{{ n8n_host_port }}"
+        state: started
+        timeout: 60

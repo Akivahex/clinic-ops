@@ -1,0 +1,65 @@
+---
+- hosts: webserver
+  become: yes
+  gather_facts: yes
+
+  vars:
+    n8n_data_dir: /opt/n8n/.n8n
+    n8n_image: docker.io/n8nio/n8n:latest   # en prod, fija versión
+    n8n_container: n8n
+    n8n_unit: "container-{{ n8n_container }}.service"
+    n8n_host_ip: 127.0.0.1                  # SOLO localhost (no expone Internet)
+    n8n_host_port: 5678
+    n8n_container_port: 5678
+
+  tasks:
+    - name: Crear directorio de datos n8n
+      file:
+        path: "{{ n8n_data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Propietario UID/GID 1000 (usuario node en la imagen)
+      file:
+        path: "{{ n8n_data_dir }}"
+        owner: "1000"
+        group: "1000"
+        state: directory
+
+    - name: Parar service previo si existe
+      systemd:
+        name: "{{ n8n_unit }}"
+        state: stopped
+      ignore_errors: yes
+
+    - name: Borrar contenedor n8n si existe
+      command: podman rm -f {{ n8n_container }}
+      register: rm_out
+      failed_when: false
+      changed_when: "'no such container' not in (rm_out.stderr | default(''))"
+
+    - name: Crear contenedor n8n (solo localhost {{ n8n_host_ip }}:{{ n8n_host_port }})
+      command:
+        argv:
+          - podman
+          - create
+          - --replace
+          - --name
+          - "{{ n8n_container }}"
+          - --restart=always
+          - -p
+          - "{{ n8n_host_ip }}:{{ n8n_host_port }}:{{ n8n_container_port }}"
+          - -v
+          - "{{ n8n_data_dir }}:/home/node/.n8n"
+          - -e
+          - "GENERIC_TIMEZONE=Europe/Berlin"
+          - -e
+          - "N8N_PORT={{ n8n_container_port }}"
+          - -e
+          - "N8N_METRICS=false"
+          - -e
+          - "N8N_DIAGNOSTICS_ENABLED=false"
+          - "{{ n8n_image }}"
+      register: create_out
+      failed_when: create_out.rc not in [0]
+      changed_when: true
