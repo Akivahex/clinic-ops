@@ -55,11 +55,9 @@ resource "hcloud_server" "main" {
   }
 }
 
-// 4. GENERAR EL INVENTARIO DE ANSIBLE
-// Este recurso usa una plantilla para crear un archivo de inventario estático.
 resource "local_file" "ansible_inventory" {
-  content  = templatefile("${path.module}/inventory.tpl", {
-    server_ip = hcloud_server.main.ipv4_address // <-- CORREGIDO
+  content = templatefile("${path.module}/../ansible/inventory/inventory.tpl", {
+    server_ip = hcloud_server.main.ipv4_address
   })
-  filename = "${path.module}/inventory.ini"
+  filename = "${path.module}/../ansible/inventory/inventory.ini"
 }

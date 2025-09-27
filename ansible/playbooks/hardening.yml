@@ -4,190 +4,174 @@
   gather_facts: yes
 
   vars:
+    # --- App web simple (Nginx) ---
     app_dir: /opt/app/simple-nginx
-    image_name: localhost/simple-nginx
-    image_tag: "1.0"
-    image_ref: "{{ image_name }}:{{ image_tag }}"
-    container_name: web-app
-    service_unit: "container-{{ container_name }}.service"
-    host_port: "80"
-    container_port: "8080"
+    build_ctx_src: "{{ playbook_dir }}/../../apps/simple-nginx/"
+    web_image: "localhost/simple-nginx:1.0"
+    web_container: "web-app"
+    web_host_port: "80"
+    web_container_port: "8080"
+
+    # --- n8n ---
+    n8n_image: "docker.io/n8nio/n8n:1.112.6"
+    n8n_container: "n8n"
+    n8n_data_dir: "/opt/n8n/.n8n"
+    n8n_bind: "127.0.0.1:5678:5678"
+    GENERIC_TIMEZONE: "Europe/Berlin"
+    N8N_PORT: "5678"
+    N8N_METRICS: "false"
+    N8N_DIAGNOSTICS_ENABLED: "false"
+    N8N_DISABLE_PRODUCTION_MAIN_MENU: "true"
 
   pre_tasks:
-    - name: Actualizar caché APT
+    - name: Actualizar caché de apt
       apt:
         update_cache: yes
-        cache_valid_time: 3600
+      changed_when: false
 
-  tasks:
-    # --- BASE: Podman y utilidades ---
-    - name: Instalar Podman y utilidades
+    - name: Paquetes base (Podman, UFW, curl)
       apt:
         name:
           - podman
-          - containernetworking-plugins
-          - jq
           - ufw
+          - curl
         state: present
 
-    # --- Deshabilitar Docker si existe (no lo usamos) ---
-    - name: Detener/Deshabilitar Docker (si está instalado)
-      service:
-        name: "{{ item }}"
-        state: stopped
-        enabled: no
-      loop:
-        - docker
-        - docker.socket
-      ignore_errors: yes
-
-    # --- Limpiar units legacy que daban error (si existen) ---
-    - name: Deshabilitar units legacy (si existen)
-      systemd:
-        name: "{{ item }}"
-        state: stopped
-        enabled: no
-      loop:
-        - simple-nginx-podman.service
-        - container-simple-nginx-container.service
-      ignore_errors: yes
-
-    - name: Eliminar files de units legacy (si existen)
-      file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/systemd/system/simple-nginx-podman.service
-        - /etc/systemd/system/container-simple-nginx-container.service
-      ignore_errors: yes
-
-    - name: Recargar systemd y limpiar fallidos
+    - name: Asegurar que Docker está deshabilitado (si existe)
       shell: |
-        systemctl daemon-reload
-        systemctl reset-failed
-      args:
-        executable: /bin/bash
+        systemctl disable --now docker docker.socket 2>/dev/null || true
       changed_when: false
 
-    # --- Preparar directorio app y fuentes ---
-    - name: Crear directorio de la app
+  tasks:
+    ##################################################################
+    # 1) WEB: construir imagen y desplegar como servicio systemd
+    ##################################################################
+    - name: Crear directorio de app web
       file:
         path: "{{ app_dir }}"
         state: directory
         mode: "0755"
 
-    - name: Copiar fuentes de la app (Dockerfile + nginx.conf + index.html)
+    - name: Copiar fuentes de la app (contexto de build)
       copy:
-        src: ./simple-nginx/
+        src: "{{ build_ctx_src }}"
         dest: "{{ app_dir }}/"
 
-    # --- Asegurar FROM plenamente calificado para Podman ---
-    - name: Forzar FROM plenamente calificado para Podman
+    - name: Normalizar FROM del Dockerfile a FQDN (nginx -> docker.io/library/nginx)
       replace:
         path: "{{ app_dir }}/Dockerfile"
-        regexp: '^FROM\s+nginx:'
-        replace: 'FROM docker.io/library/nginx:'
+        regexp: '^FROM\s+nginx:(\S+)'
+        replace: 'FROM docker.io/library/nginx:\1'
 
-    # --- Construir imagen con Podman ---
-    - name: Construir imagen (podman build)
-      command: >
-        podman build -t {{ image_ref }} {{ app_dir }}
-      register: build_out
-      changed_when: "'Successfully tagged' in (build_out.stdout | default('')) or 'COMMIT' in (build_out.stdout | default(''))"
+    - name: Build de la imagen (solo si no existe)
+      shell: |
+        podman image exists "{{ web_image }}" || podman build -t "{{ web_image }}" "{{ app_dir }}"
 
-    # --- Idempotencia: parar servicio si existe ---
-    - name: Parar servicio si existe
-      systemd:
-        name: "{{ service_unit }}"
-        state: stopped
-      ignore_errors: yes
+    - name: Crear/actualizar contenedor web (host:{{ web_host_port }} -> {{ web_container_port }})
+      shell: |
+        podman create --replace --name "{{ web_container }}" \
+          --restart=always -p {{ web_host_port }}:{{ web_container_port }} "{{ web_image }}"
 
-    # --- Limpiar contenedor previo (si existe) ---
-    - name: Borrar contenedor antiguo si existiera
-      command: podman rm -f {{ container_name }}
-      register: rm_out
-      failed_when: false
-      changed_when: "'no such container' not in (rm_out.stderr | default(''))"
-
-    # --- Crear contenedor en estado created (con --replace) ---
-    - name: Crear contenedor (host:{{ host_port }} -> contenedor:{{ container_port }})
-      command: >
-        podman create --replace --name {{ container_name }}
-        --restart=always
-        -p {{ host_port }}:{{ container_port }}
-        {{ image_ref }}
-      register: create_out
-      failed_when: create_out.rc not in [0]
-      changed_when: true
-
-    # --- Generar unit systemd desde el contenedor ---
-    - name: Generar unit systemd (podman generate systemd)
-      command: >
-        podman generate systemd --name {{ container_name }} --files --new --restart-policy=always
+    - name: Generar unidad systemd del contenedor web (una vez)
+      shell: |
+        podman generate systemd --name "{{ web_container }}" --files
       args:
-        chdir: /tmp
-      register: gen_out
+        chdir: "/etc/systemd/system"
+        creates: "/etc/systemd/system/container-{{ web_container }}.service"
 
-    - name: Copiar unit a /etc/systemd/system
-      copy:
-        src: "/tmp/{{ service_unit }}"
-        dest: "/etc/systemd/system/{{ service_unit }}"
-        remote_src: true
-        mode: "0644"
-
-    # --- Activar servicio ---
-    - name: Recargar systemd
+    - name: Habilitar e iniciar servicio web
       systemd:
+        name: "container-{{ web_container }}.service"
         daemon_reload: yes
-
-    - name: Habilitar e iniciar servicio
-      systemd:
-        name: "{{ service_unit }}"
         enabled: yes
         state: started
 
-    # --- UFW mínimo seguro ---
+    ##################################################################
+    # 2) UFW: abrir solo lo necesario
+    ##################################################################
+    - name: Comprobar estado de UFW
+      shell: ufw status
+      register: ufw_status
+      changed_when: false
+
     - name: Habilitar UFW si está inactivo
+      shell: ufw --force enable
+      when: "'Status: inactive' in ufw_status.stdout"
+
+    - name: Reglas UFW estándar (22,80,443)
       shell: |
-        ufw status | grep -q "Status: active" || ufw --force enable
-      args:
-        executable: /bin/bash
+        ufw status | grep -q '^22/tcp'  || ufw allow 22/tcp
+        ufw status | grep -q '^80/tcp'  || ufw allow 80/tcp
+        ufw status | grep -q '^443/tcp' || ufw allow 443/tcp
       changed_when: false
 
-    - name: Políticas base UFW
+    ##################################################################
+    # 3) n8n: contenedor + systemd (solo localhost:5678)
+    ##################################################################
+    - name: Crear directorio de datos n8n (propietario 1000)
+      file:
+        path: "{{ n8n_data_dir }}"
+        state: directory
+        mode: "0755"
+        owner: "1000"
+        group: "1000"
+        recurse: yes
+
+    - name: Crear/actualizar contenedor n8n (127.0.0.1:5678)
       shell: |
-        ufw status verbose | grep -q "Default: deny (incoming), allow (outgoing)" || (
-          ufw default deny incoming && ufw default allow outgoing
-        )
-      args:
-        executable: /bin/bash
-      changed_when: false
+        podman create --replace --name "{{ n8n_container }}" --restart=always \
+          -p "{{ n8n_bind }}" \
+          -v "{{ n8n_data_dir }}:/home/node/.n8n" \
+          -e GENERIC_TIMEZONE={{ GENERIC_TIMEZONE }} \
+          -e N8N_PORT={{ N8N_PORT }} \
+          -e N8N_METRICS={{ N8N_METRICS }} \
+          -e N8N_DIAGNOSTICS_ENABLED={{ N8N_DIAGNOSTICS_ENABLED }} \
+          -e N8N_DISABLE_PRODUCTION_MAIN_MENU={{ N8N_DISABLE_PRODUCTION_MAIN_MENU }} \
+          "{{ n8n_image }}"
 
-    - name: Permitir SSH/HTTP/HTTPS
-      shell: ufw allow {{ item }}
+    - name: Generar unidad systemd de n8n (una vez)
+      shell: |
+        podman generate systemd --name "{{ n8n_container }}" --files
       args:
-        executable: /bin/bash
-      loop:
-        - 22/tcp
-        - 80/tcp
-        - 443/tcp
-      changed_when: false
+        chdir: "/etc/systemd/system"
+        creates: "/etc/systemd/system/container-{{ n8n_container }}.service"
 
-    # --- Comprobaciones ---
-    - name: Esperar a que el puerto {{ host_port }} responda
-      wait_for:
-        host: "127.0.0.1"
-        port: "{{ host_port }}"
+    - name: Habilitar e iniciar servicio n8n
+      systemd:
+        name: "container-{{ n8n_container }}.service"
+        daemon_reload: yes
+        enabled: yes
         state: started
-        timeout: 30
 
-    - name: Probar HTTP local
-      shell: curl -sI http://127.0.0.1/ | head -n1
-      args:
-        executable: /bin/bash
-      register: curl_check
+    ##################################################################
+    # 4) Verificaciones amigables
+    ##################################################################
+    - name: Estado servicios (web y n8n)
+      shell: |
+        echo -n "web: ";  systemctl is-active container-{{ web_container }}.service  || true
+        echo -n "n8n: ";  systemctl is-active container-{{ n8n_container }}.service || true
+      register: svc_states
       changed_when: false
 
-    - name: Mostrar estado HTTP
+    - name: Puertos escuchando (80 y 5678)
+      shell: "ss -tulpn | egrep ':(80|5678) ' || true"
+      register: listeners
+      changed_when: false
+
+    - name: HTTP local a web (127.0.0.1:80)
+      shell: "curl -sI http://127.0.0.1/ | head -n1 || true"
+      register: http_web
+      changed_when: false
+
+    - name: HTTP local a n8n (127.0.0.1:5678)
+      shell: "curl -sI http://127.0.0.1:5678/ | head -n1 || true"
+      register: http_n8n
+      changed_when: false
+
+    - name: Mostrar resultados
       debug:
-        msg: "{{ curl_check.stdout }}"
+        msg:
+          - "Servicios: {{ svc_states.stdout_lines | default([]) }}"
+          - "Sockets:   {{ listeners.stdout_lines   | default([]) }}"
+          - "Web:       {{ http_web.stdout | default('') | trim }}"
+          - "n8n:       {{ http_n8n.stdout | default('') | trim }}"
